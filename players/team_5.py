@@ -1,26 +1,37 @@
 import math
 import random
 import fast_tsp
-import pyvisgraph as vg
 import os
-import numpy as np
 from collections import deque, defaultdict
 from itertools import chain
-from sklearn.cluster import AgglomerativeClustering
-from scipy.spatial import ConvexHull, Delaunay
-from shapely.geometry import Polygon
-import matplotlib.pyplot as plt
+import rvo2
+
 random.seed(2)
 
-DEBUG = False
-LOOKUP_INTERVAL = 1
-OBSTACLE_HITBOX_SIZE = 2.1
-STALL_HITBOX_SIZE = 2
+LOOKUP_INTERVAL = 8
+DIST_EPS = 1e-5
 
-class Position():
+#RVO Simulator Properties
+TIME_STEP = 1
+NEIGHBOR_DIST = 8
+MAX_NEIGHBORS = 6
+TIME_HORIZON = 1
+TIME_HORIZON_OBS = 2
+RADIUS = 0.5
+MAX_SPEED = 1
+DEF_VELO = (0, 0)
+
+class Point():
     def __init__(self, x, y):
         self.x = x
         self.y = y
+
+    @staticmethod
+    def from_3d(pt):
+        return Point(pt[0] * 5, pt[2] * 5)
+
+    def to_3d(self):
+        return (self.x / 5, 0.0, self.y / 5)
 
 class Player:
     def __init__(self, id, name, color, initial_pos_x, initial_pos_y, stalls_to_visit, T_theta, tsp_path, num_players):
@@ -40,22 +51,28 @@ class Player:
 
         self.sign_x = 1
         self.sign_y = 1
-        self.eps = 1e-5
 
-        # pathing
+        # global pathing
         self.dists = [[0 for _ in range(self.num_stalls + 1)] for _ in range(self.num_stalls + 1)]
         self.q = deque()
+        self.need_update = True
         self.__init_tsp()
         self.__init_queue()
-    
-        # obstacle avoidance
-        self.lookup_timer = 1
-        self.polys = defaultdict(list)
-        self.graph = vg.VisGraph()
-        self.workers = len(os.sched_getaffinity(0))
-        self.need_update = True
+
+        # init rvo and environment boundary
+        self.sim = None
+        self.agent = None
+        self.agent_q = deque()
+        self.agent_id = dict()
+        self.prev_pos = dict()
+        self.__init_rvo()         
+
+        # local avoidance
+        self.lookup_timer = LOOKUP_INTERVAL
         self.path = deque()
         self.collision = 0
+        self.is_alert = False
+        self.seen_obs = set()
 
     def __init_queue(self):
         stv = self.stalls_to_visit
@@ -70,29 +87,52 @@ class Player:
         px, py = self.pos_x, self.pos_y
 
         for i in range(0, n):
-            d = self.__calc_distance(px, py, stv[i].x, stv[i].y)
+            d = Player.__calc_distance(px, py, stv[i].x, stv[i].y)
             self.dists[0][i+1] = math.ceil(d)
 
         for i in range(0, n):
             for j in range(0, n):
-                d = self.__calc_distance(stv[i].x, stv[i].y, stv[j].x, stv[j].y)
+                d = Player.__calc_distance(stv[i].x, stv[i].y, stv[j].x, stv[j].y)
                 self.dists[i+1][j+1] = math.ceil(d)
                 
         self.tsp_path = fast_tsp.find_tour(self.dists) if n > 1 else [0, 1]
 
-    def __calc_distance(self, x1, y1, x2, y2):
+    def __init_rvo(self):
+        self.sim = rvo2.PyRVOSimulator(TIME_STEP,
+                                       NEIGHBOR_DIST,
+                                       MAX_NEIGHBORS,
+                                       TIME_HORIZON,
+                                       TIME_HORIZON_OBS,
+                                       RADIUS,
+                                       MAX_SPEED,
+                                       DEF_VELO)
+        # environment bound
+        self.sim.addObstacle([(0.0, 0.0),
+                              (0.0, 100.0),
+                              (100.0, 100.0),
+                              (100.0, 0.0)])
+        # self
+        self.agent = self.sim.addAgent((self.pos_x, self.pos_y))
+
+    @staticmethod
+    def __calc_distance(x1, y1, x2, y2):
         return math.sqrt((x1 - x2)**2 + (y1 - y2)**2)
 
-    def __normalize(self, vx, vy):
-        norm = self.__calc_distance(vx, vy, 0, 0)
+    @staticmethod
+    def __normalize(vx, vy):
+        norm = Player.__calc_distance(vx, vy, 0, 0)
 
         return vx / norm, vy / norm
 
-    def __dot(self, a, b):
-        ax, ay = a
-        bx, by = b
+    @staticmethod
+    def __build_poly(o_x, o_y):
+        poly = []
+        poly.append((o_x - 1.1, o_y - 1.1))
+        poly.append((o_x + 1.1, o_y - 1.1))
+        poly.append((o_x + 1.1, o_y + 1.1))
+        poly.append((o_x - 1.1, o_y + 1.1))
 
-        return ax * bx + ay * by
+        return poly
 
     # simulator calls this function when the player collects an item from a stall
     def collect_item(self, stall_id):
@@ -109,94 +149,73 @@ class Player:
                     break
             self.q.remove(r)
 
-    def __check_fov(self, obstacle):
-        bx, by = obstacle[1], obstacle[2]
-        fov = math.cos(math.pi / 8)
-        a = self.vx, self.vy 
-        b = self.__normalize(bx - self.pos_x, by - self.pos_y)
+    def __kill_agent(self, aid):
+        sim = self.sim
 
-        return self.__dot(a, b) > fov
+        sim.setAgentPosition(aid, (-1, -1))
+        sim.setAgentPrefVelocity(aid, DEF_VELO)
+        sim.setAgentVelocity(aid, DEF_VELO)
+        sim.setAgentNeighborDist(aid, 0)
+        sim.setAgentMaxNeighbors(aid, 0)
 
-    # deprecated
-    def __build_poly(self, obstacle):
-        o_x, o_y = obstacle[1], obstacle[2]
-
-        poly = []
-        poly.append(vg.Point(o_x - 2, o_y - 2))
-        poly.append(vg.Point(o_x + 2, o_y - 2))
-        poly.append(vg.Point(o_x + 2, o_y + 2))
-        poly.append(vg.Point(o_x - 2, o_y + 2))
-
-        return poly
 
     # simulator calls this function when it passes the lookup information
     # this function is called if the player returns 'lookup' as the action in the get_action function
     def pass_lookup_info(self, other_players, obstacles):
-        polys = self.polys
+        seen = self.seen_obs
+        sim = self.sim
 
-        for o in obstacles:
-            if o not in polys:
-                polys[o] = self.__build_poly(o)
-                self.need_update = True
+        for oid, ox, oy in obstacles:
+            if oid not in seen:
+                seen.add(oid)
+                sim.addObstacle(Player.__build_poly(ox, oy))
 
-    def __merge_nearby_obstacles(self):
-        obstacle_centers = np.array(list(self.polys.keys()))[:,1:]
-        ac = AgglomerativeClustering(n_clusters=None, linkage='single', metric='euclidean', distance_threshold=math.sqrt(2 * (OBSTACLE_HITBOX_SIZE * 2) ** 2))
-        clusters = ac.fit(obstacle_centers).labels_
-        
-        blobs = []
-        for i in range(0, clusters.max() + 1):
-            cluster_centers = obstacle_centers[clusters == i]
-            cluster_vertices = np.empty((len(cluster_centers) * 4, 2))
-            for i, center in enumerate(cluster_centers):
-                for j, d in enumerate(np.array([[1, 1], [1, -1], [-1, 1], [-1, -1]]) * OBSTACLE_HITBOX_SIZE):
-                    cluster_vertices[i * 4 + j] = center + d
-            hull = ConvexHull(cluster_vertices)
-            blob = cluster_vertices[hull.vertices]
-            for stall_center in self.stalls_to_visit + [Position(self.pos_x, self.pos_y)]:
-                if Delaunay(blob).find_simplex((stall_center.x, stall_center.y)):
-                    stall = Polygon([(stall_center.x + d1, stall_center.y + d2) for d1, d2 in np.array([[1, 1], [1, -1], [-1, -1], [-1, 1]]) * STALL_HITBOX_SIZE])
-                    blob = list(Polygon(blob).difference(stall).exterior.coords)
-            blobs.append(blob)
-        
-        if DEBUG:
-            plt.figure()
-            plt.axis('scaled')
-            plt.xlim(0, 100)
-            plt.ylim(0, 100)
-            plt.gca().invert_yaxis()
-            for blob in blobs:
-                plt.plot(*zip(*blob))
-            plt.show()
-        
-        return [[vg.Point(point[0], point[1]) for point in blob] for blob in blobs]
+        sim.processObstacles()
 
-    def __update_vg(self):
-        if not self.polys:
-            return
-        if len(self.polys) == 1:
-            p = list(self.polys.values())
-        else :
-            p = self.__merge_nearby_obstacles()
-        self.graph.build(p, self.workers)
+        killed = []
+        for pid in self.agent_id:
+            if pid not in (p for p, _, _ in other_players):
+                aid = self.agent_id[pid]
+                self.__kill_agent(aid)
+                self.agent_q.append(aid)
+                killed.append(pid)
+        for k in killed:
+            self.agent_id.pop(pid, -1)
+
+        for pid, px, py in other_players:
+            if pid in self.agent_id:
+                aid = self.agent_id[pid]
+                prevx, prevy = self.prev_pos[pid]
+                pv = (px - prevx, py - prevy)
+                if sim.getAgentPrefVelocity(aid) == DEF_VELO:
+                    sim.setAgentPrefVelocity(aid, pv)
+                sim.setAgentPosition(aid, (px, py))
+                sim.setAgentVelocity(aid, pv)
+                self.prev_pos[pid] = (px, py)
+            else:
+                if self.agent_q:
+                    aid = self.agent_q.popleft()
+                    sim.setAgentPosition(aid, (px, py))
+                    sim.setAgentNeighborDist(aid, NEIGHBOR_DIST)
+                    sim.setAgentMaxNeighbors(aid, MAX_NEIGHBORS)
+                else:
+                    aid = sim.addAgent((px, py))
+                self.agent_id[pid] = aid
+                sim.setAgentPrefVelocity(aid, DEF_VELO)
+                sim.setAgentVelocity(aid, DEF_VELO)
+                self.prev_pos[pid] = (px, py)
+
+        self.is_alert =  sim.getAgentNumAgentNeighbors(self.agent)
 
     def __update_path(self):
-        self.path.clear()
-        s = vg.Point(self.pos_x, self.pos_y)
-        t = vg.Point(self.q[0].x, self.q[0].y)
-        if not self.polys:
-            new_path = [s, t]
-        else:
-            try:
-                new_path = self.graph.shortest_path(s, t)
-            except:
-                new_path = [s, t]
-        for p in new_path[1:]:
-            self.path.append(p)
+        if self.path:
+            self.path.popleft()
+        t = Point(self.q[0].x, self.q[0].y)
+        self.path.append(t)
 
     # simulator calls this function when the player encounters an obstacle
     def encounter_obstacle(self):
-        self.collision = 15
+        self.collision = 12
         self.lookup_timer = 0
         self.vx = random.random()
         self.vy = math.sqrt(1 - self.vx**2)
@@ -205,30 +224,32 @@ class Player:
 
     # simulator calls this function to get the action 'lookup' or 'move' from the player
     def get_action(self, pos_x, pos_y):
-        # return 'lookup' or 'move'
+        # return 'lookup' or 'move' or 'lookup move'
+        
         self.pos_x = pos_x
         self.pos_y = pos_y
-
+        self.sim.setAgentPosition(self.agent, (pos_x, pos_y))
+        
         if len(self.q) == 0:
             return 'move'
 
         if self.need_update:
-            self.__update_vg()
             self.__update_path()
             self.need_update = False
 
         t = self.path[0]
 
-        if self.__calc_distance(pos_x, pos_y, t.x, t.y) < self.eps:
+        if Player.__calc_distance(pos_x, pos_y, t.x, t.y) < DIST_EPS:
             self.path.popleft()
 
         if self.lookup_timer == 0:
-            self.lookup_timer = LOOKUP_INTERVAL
+            self.lookup_timer = 1 if self.is_alert else LOOKUP_INTERVAL
+            self.is_alert = False
 
-            return 'lookup'
+            return 'lookup move'
         
         self.lookup_timer -= 1
-        
+
         return 'move'
     
     # simulator calls this function to get the next move from the player
@@ -243,13 +264,36 @@ class Player:
             t = self.path[0]
             vx = t.x - self.pos_x
             vy = t.y - self.pos_y
+            self.sim.setAgentPrefVelocity(self.agent, (vx, vy))
             self.sign_x = 1
             self.sign_y = 1
-            
-            self.vx, self.vy = self.__normalize(vx, vy) if self.__calc_distance(vx, vy, 0, 0) > 1 else (vx, vy)
-
+            self.sim.doStep()
+            self.vx, self.vy = self.sim.getAgentVelocity(self.agent)
+            #print(f"{self.q[0].id} : {self.vx}, {self.vy}")
+            #print("pos: ", self.pos_x, self.pos_y)
+            #print("sim pos: ", self.sim.getAgentPosition(self.agent))
         elif len(self.q) == 0:
             self.vx, self.vy = 0, 0
+
+        if self.pos_x <= 0:
+            self.sign_x = 1
+            self.vx = random.random()
+            self.vy = math.sqrt(1 - self.vx**2)
+
+        if self.pos_y <= 0:
+            self.sign_y = 1
+            self.vx = random.random()
+            self.vy = math.sqrt(1 - self.vx**2)
+
+        if self.pos_x >= 100:
+            self.sign_x = -1
+            self.vx = random.random()
+            self.vy = math.sqrt(1 - self.vx**2)
+
+        if self.pos_y >= 100:
+            self.sign_y = -1
+            self.vx = random.random()
+            self.vy = math.sqrt(1 - self.vx**2)
 
         new_pos_x = self.pos_x + self.sign_x * self.vx
         new_pos_y = self.pos_y + self.sign_y * self.vy
